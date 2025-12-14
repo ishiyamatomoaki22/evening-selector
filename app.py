@@ -1,3 +1,4 @@
+import io
 import re
 import numpy as np
 import pandas as pd
@@ -184,6 +185,52 @@ def make_filename(machine: str, suffix: str, date_str: str) -> str:
 
     return f"{date_str}_{time_part}_{safe_machine}_{suffix}.csv"
 
+# ======== Play Log (append to uploaded CSV) ========
+PLAYLOG_HEADER = [
+    "created_at",          # 記録作成日時（自動）
+    "date","shop","machine","unit_number",
+    "start_time","end_time",
+    "invest_medals","payout_medals","profit_medals",
+    "play_games",
+    "stop_reason","memo"
+]
+
+def append_row_to_uploaded_csv(uploaded_bytes: bytes, new_row: dict) -> bytes:
+    """
+    既存CSV(アップロード)を読み込み → 1行追記 → CSV bytes を返す
+    """
+    df = pd.read_csv(io.BytesIO(uploaded_bytes))
+
+    # ヘッダー不足でも壊れないように補完
+    for c in PLAYLOG_HEADER:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[PLAYLOG_HEADER]
+
+    # 追記行
+    df2 = pd.DataFrame([new_row], columns=PLAYLOG_HEADER)
+    df_out = pd.concat([df, df2], ignore_index=True)
+
+    return df_out.to_csv(index=False).encode("utf-8-sig")
+
+def make_safe_filename_part(s: str) -> str:
+    return (
+        str(s)
+        .replace(" ", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "-")
+    )
+
+def make_log_filename(date_str: str, machine: str) -> str:
+    """
+    YYYY-MM-dd_HH-mm-ss_機種名_playlog.csv
+    """
+    time_part = datetime.now().strftime("%H-%M-%S")
+    safe_machine = make_safe_filename_part(machine)
+    return f"{date_str}_{time_part}_{safe_machine}_playlog.csv"
+
+
 # ========= Sidebar: meta & thresholds =========
 # 初期化（スライダー値をsession_stateで持つ）
 if "min_games" not in st.session_state:
@@ -271,7 +318,11 @@ with st.sidebar:
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
 # ========= Main UI =========
-tab1, tab2 = st.tabs(["入力 → 変換（統一CSV作成）", "夕方候補（統一CSVを選択して判定）"])
+tab1, tab2, tab3 = st.tabs([
+    "入力 → 変換（統一CSV作成）",
+    "夕方候補（統一CSVを選択して判定）",
+    "実戦ログ（CSVに追記して更新版DL）"
+])
 
 with tab1:
     st.subheader("① 入力 → 変換（統一済みCSVを作成してダウンロード）")
@@ -380,3 +431,92 @@ with tab2:
         mime="text/csv",
         key="tab2_dl_candidates"
     )
+
+with tab3:
+    st.subheader("③ 実戦ログ（ローカルCSVに追記 → 更新版をダウンロード）")
+    st.caption("※ Streamlit Cloudではローカルファイルを直接書き換えできないため、追記した“更新版CSV”を生成してダウンロードします。")
+
+    # 1) 追記対象のCSVをアップロード
+    uploaded_log = st.file_uploader(
+        "追記したいログCSVを選択（既存のplay_log.csvなど）",
+        type=["csv"],
+        key="tab3_log_upload"
+    )
+
+    st.divider()
+
+    # 2) 入力フォーム（必要最低限＋任意）
+    with st.form("playlog_form", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            log_date = st.text_input("date（YYYY-MM-DD）", value=date_str)
+            log_shop = st.text_input("shop", value=shop)
+        with col2:
+            log_machine = st.text_input("machine", value=machine)
+            unit_number = st.number_input("unit_number（台番号）", min_value=0, step=1, value=0)
+        with col3:
+            play_games = st.number_input("play_games（自分が回したG数）", min_value=0, step=10, value=0)
+
+        col4, col5, col6 = st.columns(3)
+        with col4:
+            start_time = st.text_input("start_time（例 18:10）", value="")
+        with col5:
+            end_time = st.text_input("end_time（例 20:45）", value="")
+        with col6:
+            stop_reason = st.selectbox(
+                "stop_reason（ヤメ理由）",
+                ["", "閉店", "REG悪化", "合算悪化", "資金切れ", "他に移動", "その他"]
+            )
+
+        col7, col8, col9 = st.columns(3)
+        with col7:
+            invest = st.number_input("invest_medals（投資枚）", min_value=0, step=50, value=0)
+        with col8:
+            payout = st.number_input("payout_medals（回収枚）", min_value=0, step=50, value=0)
+        with col9:
+            profit = int(payout - invest)
+            st.metric("profit_medals（収支枚）", profit)
+
+        memo = st.text_area("memo（任意）", value="", height=100)
+
+        submit = st.form_submit_button("この内容で追記用データを作成", type="primary")
+
+    # 3) 追記 → 更新版CSVダウンロード
+    if submit:
+        if uploaded_log is None:
+            st.error("先に「追記したいログCSV」を選択してください。")
+            st.stop()
+
+        new_row = {
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": log_date,
+            "shop": log_shop,
+            "machine": log_machine,
+            "unit_number": int(unit_number),
+            "start_time": start_time,
+            "end_time": end_time,
+            "invest_medals": int(invest),
+            "payout_medals": int(payout),
+            "profit_medals": int(profit),
+            "play_games": int(play_games),
+            "stop_reason": stop_reason,
+            "memo": memo,
+        }
+
+        out_bytes = append_row_to_uploaded_csv(uploaded_log.getvalue(), new_row)
+        out_name = make_log_filename(log_date, log_machine)
+
+        st.success("追記済みの更新版CSVを作成しました。下のボタンからダウンロードしてください。")
+        st.download_button(
+            "追記済みログCSVをダウンロード（更新版）",
+            data=out_bytes,
+            file_name=out_name,
+            mime="text/csv",
+            key="tab3_log_download"
+        )
+
+        # 参考：追記後のプレビュー
+        st.divider()
+        st.markdown("#### 追記後プレビュー（末尾5行）")
+        preview_df = pd.read_csv(io.BytesIO(out_bytes))
+        st.dataframe(preview_df.tail(5), use_container_width=True, hide_index=True)
