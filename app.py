@@ -87,17 +87,45 @@ def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def clean_to_12_parts(line: str):
+    """
+    先頭にアイコン等のゴミが混ざっても、
+    数値/確率(1/xxx)だけ抽出して12列に整形する。
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    parts = re.split(r"\s+", line)
+
+    # 数値 or 1/数値 だけ残す
+    def is_data_token(tok: str) -> bool:
+        tok = tok.strip().replace(",", "")
+        return bool(re.match(r"^(?:\d+(?:\.\d+)?|1/\d+(?:\.\d+)?)$", tok))
+
+    data_parts = [p.replace(",", "") for p in parts if is_data_token(p)]
+
+    # 先頭に余計なものが入った場合は data_parts が13個以上になることがある
+    if len(data_parts) > 12:
+        data_parts = data_parts[-12:]  # ★最後の12個を採用（先頭ゴミ対策）
+
+    if len(data_parts) != 12:
+        return None  # 呼び出し側でエラー処理
+
+    return data_parts
+
+
 def parse_raw12(text: str, date_str: str, shop: str, machine: str) -> pd.DataFrame:
     rows = []
     for line_no, line in enumerate((text or "").splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        parts = re.split(r"\s+", line)
-        if len(parts) != 12:
-            raise ValueError(f"{line_no}行目：列数が合いません（期待12 / 実際{len(parts)}）: {line}")
+        parts12 = clean_to_12_parts(line)
+        if parts12 is None:
+            # 空行はスキップ、そうでなければ原因が分かるようにエラー
+            if line.strip() == "":
+                continue
+            raise ValueError(f"{line_no}行目：12列に整形できませんでした: {line}")
 
-        unit_number, start_games, total_start, bb_count, rb_count, art_count, max_medals, bb_rate, rb_rate, art_rate, gassan_rate, prev_day_end = parts
+        unit_number, start_games, total_start, bb_count, rb_count, art_count, max_medals, bb_rate, rb_rate, art_rate, gassan_rate, prev_day_end = parts12
 
         rows.append({
             "date": date_str, "shop": shop, "machine": machine,
@@ -206,31 +234,51 @@ with tab2:
         st.info("先に「入力 → 変換」タブでデータを読み込んでください。")
         st.stop()
 
-    # 夕方候補抽出
+    # =========================
+    # 安定化：比較・計算用の数値列を作る
+    # =========================
+    df = df.copy()
+    df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
+    df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
+    df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
+
+    # =========================
+    # 夕方候補抽出（num列で判定）
+    # =========================
     cand = df[
-        (pd.to_numeric(df["total_start"], errors="coerce") >= min_games) &
-        (pd.to_numeric(df["rb_rate"], errors="coerce") <= max_rb) &
-        (pd.to_numeric(df["gassan_rate"], errors="coerce") <= max_gassan)
+        (df["total_start_num"] >= min_games) &
+        (df["rb_rate_num"] <= max_rb) &
+        (df["gassan_rate_num"] <= max_gassan)
     ].copy()
 
     if cand.empty:
         st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
+        # デバッグしたいときは以下を一時的に表示すると便利です
+        # st.write(df[["unit_number","total_start","rb_rate","gassan_rate","total_start_num","rb_rate_num","gassan_rate_num"]].head(30))
         st.stop()
 
-    # スコア（REG最重視）
+    # =========================
+    # スコア（REG最重視：num列で計算）
+    # =========================
     cand["score"] = (
-        (max_rb / cand["rb_rate"]) * 70 +
-        (cand["total_start"] / max(min_games, 1)) * 20 +
-        (max_gassan / cand["gassan_rate"]) * 10
+        (max_rb / cand["rb_rate_num"]) * 70 +
+        (cand["total_start_num"] / max(min_games, 1)) * 20 +
+        (max_gassan / cand["gassan_rate_num"]) * 10
     )
 
-    cand = cand.sort_values(["rb_rate", "total_start"], ascending=[True, False])
+    # 並び順：REG優先 → 総回転
+    cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False])
+
+    # =========================
+    # 表示用（見せたい列だけ）
+    # =========================
     show = cand[[
         "date","shop","machine",
         "unit_number","total_start","bb_count","rb_count",
         "bb_rate","rb_rate","gassan_rate","score"
     ]].copy()
 
+    # 表示を整える（小数1桁）
     for c in ["bb_rate","rb_rate","gassan_rate","score"]:
         show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
 
