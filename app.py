@@ -1,31 +1,27 @@
 import re
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
 from datetime import date
 
+# ========= Config =========
 HEADER = [
     "date","shop","machine",
     "unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals",
     "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end"
 ]
 
-# あなた用の候補（好きに増やしてOK）
 SHOP_PRESETS = ["武蔵境", "吉祥寺", "三鷹", "国分寺", "新宿", "渋谷"]
-MACHINE_PRESETS = [
-    "マイジャグラーV",
-    "アイムジャグラーEX",
-    "ファンキージャグラー2",
-    "ゴーゴージャグラー3",
-]
+MACHINE_PRESETS = ["マイジャグラーV", "アイムジャグラーEX", "ファンキージャグラー2", "ゴーゴージャグラー3"]
 
-st.set_page_config(page_title="台データ → CSV整形ツール", layout="wide")
-st.title("台データオンライン（コピペ）→ CSV整形ツール")
-st.caption("12列固定の行を貼り付けて、日付・店名・機種を補完し、CSVヘッダー形式で出力します。")
+st.set_page_config(page_title="ジャグラー夕方セレクター", layout="wide")
+st.title("ジャグラー 夕方続行セレクター（変換→選定まで一発）")
+st.caption("入力（CSV or 生テキスト）→ ヘッダー統一 → 夕方判定 → 候補台を出力")
 
+# ========= Helpers =========
 def parse_rate_token(tok: str) -> float:
     """ '1/186.3' -> 186.3 , '186.3' -> 186.3 """
-    if tok is None:
+    if pd.isna(tok):
         return np.nan
     s = str(tok).strip().replace(",", "")
     if s == "":
@@ -38,7 +34,60 @@ def parse_rate_token(tok: str) -> float:
     except ValueError:
         return np.nan
 
-def parse_lines(text: str, date_str: str, shop: str, machine: str) -> pd.DataFrame:
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # 列名の空白除去
+    df.columns = df.columns.astype(str).str.strip()
+
+    rename_map = {
+        "台番": "unit_number",
+        "台番号": "unit_number",
+        "総回転": "total_start",
+        "累計スタート": "total_start",
+        "BB回数": "bb_count",
+        "RB回数": "rb_count",
+        "ART回数": "art_count",
+        "最大持ち玉": "max_medals",
+        "BB確率": "bb_rate",
+        "RB確率": "rb_rate",
+        "ART確率": "art_rate",
+        "合成確率": "gassan_rate",
+        "前日最終": "prev_day_end",
+        "店舗": "shop",
+        "機種": "machine",
+        "日付": "date",
+    }
+    return df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
+
+def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    # まず numeric 列の整形（カンマ除去も）
+    for c in ["unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals","prev_day_end"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
+
+    # rate列が無ければ作る
+    for c in ["bb_rate","rb_rate","art_rate","gassan_rate"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # 文字列の確率を分母に統一
+    df["bb_rate"] = df["bb_rate"].map(parse_rate_token)
+    df["rb_rate"] = df["rb_rate"].map(parse_rate_token)
+    df["art_rate"] = df["art_rate"].map(parse_rate_token)
+    df["gassan_rate"] = df["gassan_rate"].map(parse_rate_token)
+
+    # 欠損を total_start / 回数 で補完（必要な場合）
+    if "total_start" in df.columns:
+        bb_mask = df["bb_rate"].isna() & df["bb_count"].gt(0)
+        rb_mask = df["rb_rate"].isna() & df["rb_count"].gt(0)
+        gs_mask = df["gassan_rate"].isna() & (df["bb_count"].add(df["rb_count"]).gt(0))
+
+        df.loc[bb_mask, "bb_rate"] = df.loc[bb_mask, "total_start"] / df.loc[bb_mask, "bb_count"]
+        df.loc[rb_mask, "rb_rate"] = df.loc[rb_mask, "total_start"] / df.loc[rb_mask, "rb_count"]
+        df.loc[gs_mask, "gassan_rate"] = df.loc[gs_mask, "total_start"] / (df.loc[gs_mask, "bb_count"] + df.loc[gs_mask, "rb_count"])
+
+    return df
+
+def parse_raw12(text: str, date_str: str, shop: str, machine: str) -> pd.DataFrame:
     rows = []
     for line_no, line in enumerate((text or "").splitlines(), start=1):
         line = line.strip()
@@ -50,104 +99,146 @@ def parse_lines(text: str, date_str: str, shop: str, machine: str) -> pd.DataFra
 
         unit_number, start_games, total_start, bb_count, rb_count, art_count, max_medals, bb_rate, rb_rate, art_rate, gassan_rate, prev_day_end = parts
 
-        row = {
-            "date": date_str,
-            "shop": shop,
-            "machine": machine,
-            "unit_number": int(unit_number),
-            "start_games": float(start_games),
-            "total_start": float(total_start),
-            "bb_count": float(bb_count),
-            "rb_count": float(rb_count),
-            "art_count": float(art_count),
-            "max_medals": float(max_medals),
-            "bb_rate": parse_rate_token(bb_rate),
-            "rb_rate": parse_rate_token(rb_rate),
-            "art_rate": parse_rate_token(art_rate),
-            "gassan_rate": parse_rate_token(gassan_rate),
-            "prev_day_end": float(prev_day_end),
-        }
-        rows.append(row)
+        rows.append({
+            "date": date_str, "shop": shop, "machine": machine,
+            "unit_number": unit_number, "start_games": start_games, "total_start": total_start,
+            "bb_count": bb_count, "rb_count": rb_count, "art_count": art_count, "max_medals": max_medals,
+            "bb_rate": bb_rate, "rb_rate": rb_rate, "art_rate": art_rate, "gassan_rate": gassan_rate,
+            "prev_day_end": prev_day_end
+        })
 
     df = pd.DataFrame(rows, columns=HEADER)
+    df = compute_rates_if_needed(df)
     return df
 
-def validate_meta(shop: str, machine: str):
-    if not shop.strip():
-        st.error("店名（shop）が空です。入力または選択してください。")
-        return False
-    if not machine.strip():
-        st.error("機種（machine）が空です。入力または選択してください。")
-        return False
-    return True
+def ensure_meta_columns(df: pd.DataFrame, date_str: str, shop: str, machine: str) -> pd.DataFrame:
+    if "date" not in df.columns:
+        df["date"] = date_str
+    if "shop" not in df.columns:
+        df["shop"] = shop
+    if "machine" not in df.columns:
+        df["machine"] = machine
+    # 空欄補完
+    df["date"] = df["date"].fillna(date_str)
+    df["shop"] = df["shop"].fillna(shop)
+    df["machine"] = df["machine"].fillna(machine)
+    return df
 
-# ================= UI =================
-left, right = st.columns([1, 2], vertical_alignment="top")
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
 
-with left:
-    st.subheader("補完する情報（UIから選択 or 入力）")
-
-    # 日付：カレンダー
-    d = st.date_input("日付（date）", value=date.today())
+# ========= Sidebar: meta & thresholds =========
+with st.sidebar:
+    st.header("補完情報（date / shop / machine）")
+    d = st.date_input("日付", value=date.today())
     date_str = d.strftime("%Y-%m-%d")
 
-    st.markdown("### 店名（shop）")
-    use_custom_shop = st.checkbox("店名を手入力する", value=False)
-    if use_custom_shop:
-        shop = st.text_input("店名を入力", value="武蔵境")
+    shop_mode = st.radio("店名", ["選択", "手入力"], horizontal=True)
+    if shop_mode == "選択":
+        shop = st.selectbox("shop", SHOP_PRESETS, index=0)
     else:
-        shop = st.selectbox("店名を選択", options=SHOP_PRESETS, index=0)
+        shop = st.text_input("shop", value="武蔵境")
 
-    st.markdown("### 機種（machine）")
-    use_custom_machine = st.checkbox("機種を手入力する", value=False)
-    if use_custom_machine:
-        machine = st.text_input("機種を入力", value="マイジャグラーV")
+    machine_mode = st.radio("機種", ["選択", "手入力"], horizontal=True)
+    if machine_mode == "選択":
+        machine = st.selectbox("machine", MACHINE_PRESETS, index=0)
     else:
-        machine = st.selectbox("機種を選択", options=MACHINE_PRESETS, index=0)
+        machine = st.text_input("machine", value="マイジャグラーV")
 
     st.divider()
+    st.header("夕方判定（スライダー）")
+    min_games = st.slider("最低 総回転（total_start）", 0, 10000, 3000, 100)
+    max_rb = st.slider("REG上限（rb_rate）", 150.0, 600.0, 270.0, 1.0)
+    max_gassan = st.slider("合算上限（gassan_rate）", 80.0, 350.0, 180.0, 1.0)
 
-    st.subheader("貼り付け（取得データ：12列固定）")
-    sample = "478 45 3539 19 11 0 2481 1/186.3 1/321.7 0.0 118.0 449"
-    raw_text = st.text_area("空白区切りの行を複数貼ってOK", value=sample, height=260)
+    top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        convert = st.button("CSVに変換", type="primary")
-    with col_b:
-        clear = st.button("貼り付け欄をクリア")
+# ========= Main UI =========
+tab1, tab2 = st.tabs(["入力 → 変換", "夕方候補（選定結果）"])
 
-    if clear:
-        st.session_state["raw_text_clear"] = True
+# セッションに保存（タブを跨いで使う）
+if "df_unified" not in st.session_state:
+    st.session_state["df_unified"] = None
 
-with right:
-    # クリアボタン対応（簡易）
-    if st.session_state.get("raw_text_clear"):
-        st.session_state["raw_text_clear"] = False
-        st.info("貼り付け欄のクリアは、テキストエリアを手動で空にしてください（Streamlit仕様）")
+with tab1:
+    st.subheader("入力方法を選んでください")
+    input_mode = st.radio("入力", ["CSVアップロード", "生データ貼り付け（12列）"], horizontal=True)
 
-    st.subheader("変換結果")
-    st.write("出力ヘッダー：")
-    st.code(",".join(HEADER))
+    if input_mode == "CSVアップロード":
+        uploaded = st.file_uploader("CSVをアップロード", type=["csv"])
+        if uploaded:
+            df = pd.read_csv(uploaded)
+            df = normalize_columns(df)
+            df = ensure_meta_columns(df, date_str, shop, machine)
+            df = compute_rates_if_needed(df)
 
-    if convert:
-        if not validate_meta(shop, machine):
-            st.stop()
+            # 必須列チェック
+            required = ["unit_number","total_start","bb_count","rb_count","rb_rate","gassan_rate"]
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                st.error(f"必要な列が足りません: {missing}")
+            else:
+                # 列順をHEADERに寄せる（無い列はそのまま）
+                for c in HEADER:
+                    if c not in df.columns:
+                        df[c] = np.nan
+                df = df[HEADER]
+                st.session_state["df_unified"] = df
+                st.success(f"CSVを読み込み＆統一しました：{len(df)}行")
+                st.dataframe(df.head(30), use_container_width=True, hide_index=True)
+                st.download_button("統一済みCSVをダウンロード", data=to_csv_bytes(df), file_name="unified.csv", mime="text/csv")
 
-        try:
-            df = parse_lines(raw_text, date_str, shop, machine)
-            st.success(f"変換OK：{len(df)}行")
+    else:
+        sample = "478 45 3539 19 11 0 2481 1/186.3 1/321.7 0.0 118.0 449"
+        raw_text = st.text_area("台データオンラインの行を貼り付け（複数行OK）", value=sample, height=220)
+        if st.button("変換して統一する", type="primary"):
+            df = parse_raw12(raw_text, date_str, shop, machine)
+            st.session_state["df_unified"] = df
+            st.success(f"貼り付けデータを統一しました：{len(df)}行")
+            st.dataframe(df.head(30), use_container_width=True, hide_index=True)
+            st.download_button("統一済みCSVをダウンロード", data=to_csv_bytes(df), file_name="unified.csv", mime="text/csv")
 
-            st.dataframe(df, use_container_width=True, hide_index=True)
+with tab2:
+    st.subheader("夕方候補（本日データのみ）")
+    df = st.session_state.get("df_unified")
 
-            csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "CSVをダウンロード",
-                data=csv_bytes,
-                file_name=f"{shop}_{machine}_{date_str}.csv",
-                mime="text/csv",
-            )
+    if df is None or len(df) == 0:
+        st.info("先に「入力 → 変換」タブでデータを読み込んでください。")
+        st.stop()
 
-        except Exception as e:
-            st.error(str(e))
-            st.info("よくある原因：コピペ時に列が欠けている / 余計な文字が混ざっている / 空白区切りが崩れている")
+    # 夕方候補抽出
+    cand = df[
+        (pd.to_numeric(df["total_start"], errors="coerce") >= min_games) &
+        (pd.to_numeric(df["rb_rate"], errors="coerce") <= max_rb) &
+        (pd.to_numeric(df["gassan_rate"], errors="coerce") <= max_gassan)
+    ].copy()
+
+    if cand.empty:
+        st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
+        st.stop()
+
+    # スコア（REG最重視）
+    cand["score"] = (
+        (max_rb / cand["rb_rate"]) * 70 +
+        (cand["total_start"] / max(min_games, 1)) * 20 +
+        (max_gassan / cand["gassan_rate"]) * 10
+    )
+
+    cand = cand.sort_values(["rb_rate", "total_start"], ascending=[True, False])
+    show = cand[[
+        "date","shop","machine",
+        "unit_number","total_start","bb_count","rb_count",
+        "bb_rate","rb_rate","gassan_rate","score"
+    ]].copy()
+
+    for c in ["bb_rate","rb_rate","gassan_rate","score"]:
+        show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
+
+    st.dataframe(show.head(int(top_n)), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "候補台をCSVでダウンロード",
+        data=to_csv_bytes(show),
+        file_name="evening_candidates.csv",
+        mime="text/csv",
+    )
