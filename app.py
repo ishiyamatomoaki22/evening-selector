@@ -18,6 +18,18 @@ st.set_page_config(page_title="ジャグラー夕方セレクター", layout="wi
 st.title("ジャグラー 夕方続行セレクター（変換→選定まで一発）")
 st.caption("入力（CSV or 生テキスト）→ ヘッダー統一 → 夕方判定 → 候補台を出力")
 
+# 機種ごとのおすすめ設定（夕方向け・目安）
+RECOMMENDED = {
+    "マイジャグラーV":         {"min_games": 3000, "max_rb": 270.0, "max_gassan": 180.0},
+    "ゴーゴージャグラー3":     {"min_games": 3000, "max_rb": 280.0, "max_gassan": 185.0},
+    "ハッピージャグラーVIII":  {"min_games": 3500, "max_rb": 260.0, "max_gassan": 175.0},
+    "ファンキージャグラー2KT": {"min_games": 3000, "max_rb": 300.0, "max_gassan": 190.0},
+    "ミスタージャグラー":      {"min_games": 2800, "max_rb": 300.0, "max_gassan": 190.0},
+    "ジャグラーガールズSS":    {"min_games": 2500, "max_rb": 260.0, "max_gassan": 175.0},
+    "ネオアイムジャグラーEX":  {"min_games": 2500, "max_rb": 330.0, "max_gassan": 200.0},
+    "ウルトラミラクルジャグラー":{"min_games": 3500, "max_rb": 300.0, "max_gassan": 195.0},
+}
+
 # ========= Helpers =========
 def parse_rate_token(tok: str) -> float:
     """ '1/186.3' -> 186.3 , '186.3' -> 186.3 """
@@ -156,6 +168,22 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 # ========= Sidebar: meta & thresholds =========
+# 初期化（スライダー値をsession_stateで持つ）
+if "min_games" not in st.session_state:
+    st.session_state["min_games"] = 3000
+if "max_rb" not in st.session_state:
+    st.session_state["max_rb"] = 270.0
+if "max_gassan" not in st.session_state:
+    st.session_state["max_gassan"] = 180.0
+
+def apply_recommended(machine_name: str):
+    rec = RECOMMENDED.get(machine_name)
+    if not rec:
+        return
+    st.session_state["min_games"] = int(rec["min_games"])
+    st.session_state["max_rb"] = float(rec["max_rb"])
+    st.session_state["max_gassan"] = float(rec["max_gassan"])
+
 with st.sidebar:
     st.header("補完情報（date / shop / machine）")
     d = st.date_input("日付", value=date.today())
@@ -168,16 +196,60 @@ with st.sidebar:
         shop = st.text_input("shop", value="武蔵境")
 
     machine_mode = st.radio("機種", ["選択", "手入力"], horizontal=True)
+
+    # 機種：選択時はプリセット候補。選択されたらおすすめ値を自動セット
     if machine_mode == "選択":
-        machine = st.selectbox("machine", MACHINE_PRESETS, index=0)
+        machine = st.selectbox(
+            "machine",
+            MACHINE_PRESETS,
+            index=0,
+            on_change=lambda: apply_recommended(st.session_state["machine_select"]),
+            key="machine_select",
+        )
+        # selectboxの返り値(machine)とkey("machine_select")は同値になります
+        machine = st.session_state["machine_select"]
     else:
         machine = st.text_input("machine", value="マイジャグラーV")
 
+    # ---- 補足的におすすめ値を表示（メインではなく控えめに）----
+    rec = RECOMMENDED.get(machine)
+    with st.expander("おすすめ設定値（補足）", expanded=False):
+        if rec:
+            st.caption("※ 夕方の続行候補を“厳しめに抽出”するための目安です。店の傾向で調整してください。")
+            st.write(f"- 最低総回転: **{rec['min_games']}**")
+            st.write(f"- REG上限: **{rec['max_rb']}**")
+            st.write(f"- 合算上限: **{rec['max_gassan']}**")
+            if st.button("おすすめ値をスライダーに反映", use_container_width=True):
+                apply_recommended(machine)
+                st.rerun()
+        else:
+            st.caption("この機種はプリセット未登録です。手動でスライダーを調整してください。")
+
     st.divider()
     st.header("夕方判定（スライダー）")
-    min_games = st.slider("最低 総回転（total_start）", 0, 10000, 3000, 100)
-    max_rb = st.slider("REG上限（rb_rate）", 150.0, 600.0, 270.0, 1.0)
-    max_gassan = st.slider("合算上限（gassan_rate）", 80.0, 350.0, 180.0, 1.0)
+
+    # ★ keyを付けて、session_stateの値を直接使う
+    min_games = st.slider(
+        "最低 総回転（total_start）",
+        0, 10000,
+        value=int(st.session_state["min_games"]),
+        step=100,
+        key="min_games",
+    )
+    max_rb = st.slider(
+        "REG上限（rb_rate）",
+        150.0, 600.0,
+        value=float(st.session_state["max_rb"]),
+        step=1.0,
+        key="max_rb",
+    )
+    max_gassan = st.slider(
+        "合算上限（gassan_rate）",
+        80.0, 350.0,
+        value=float(st.session_state["max_gassan"]),
+        step=1.0,
+        key="max_gassan",
+    )
 
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
