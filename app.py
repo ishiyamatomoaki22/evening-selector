@@ -2,7 +2,7 @@ import re
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import date
+from datetime import date, datetime
 
 # ========= Config =========
 HEADER = [
@@ -167,6 +167,23 @@ def ensure_meta_columns(df: pd.DataFrame, date_str: str, shop: str, machine: str
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
+def make_filename(machine: str, suffix: str, date_str: str) -> str:
+    """
+    YYYY-MM-dd_HH-mm-ss_機種名_suffix.csv
+    suffix例: evening / candidates
+    """
+    time_part = datetime.now().strftime("%H-%M-%S")
+
+    safe_machine = (
+        str(machine)
+        .replace(" ", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "-")
+    )
+
+    return f"{date_str}_{time_part}_{safe_machine}_{suffix}.csv"
+
 # ========= Sidebar: meta & thresholds =========
 # 初期化（スライダー値をsession_stateで持つ）
 if "min_games" not in st.session_state:
@@ -288,10 +305,12 @@ with tab1:
         st.success(f"統一済みデータを作成しました：{len(df_unified)}行")
         st.dataframe(df_unified.head(30), use_container_width=True, hide_index=True)
 
+        filename = make_filename(machine, "original", date_str)
+
         st.download_button(
-            "統一済みCSVをダウンロード（unified.csv）",
+            "統一済みCSVをダウンロード",
             data=to_csv_bytes(df_unified),
-            file_name="unified.csv",
+            file_name=filename,
             mime="text/csv",
             key="tab1_dl_unified"
         )
@@ -352,10 +371,12 @@ with tab2:
 
     st.dataframe(show.head(int(top_n)), use_container_width=True, hide_index=True)
 
+    filename = make_filename(machine, "candidates", date_str)
+
     st.download_button(
         "候補台をCSVでダウンロード",
         data=to_csv_bytes(show),
-        file_name="evening_candidates.csv",
+        file_name=filename,
         mime="text/csv",
         key="tab2_dl_candidates"
     )
