@@ -182,69 +182,74 @@ with st.sidebar:
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
 # ========= Main UI =========
-tab1, tab2 = st.tabs(["入力 → 変換", "夕方候補（選定結果）"])
-
-# セッションに保存（タブを跨いで使う）
-if "df_unified" not in st.session_state:
-    st.session_state["df_unified"] = None
+tab1, tab2 = st.tabs(["入力 → 変換（統一CSV作成）", "夕方候補（統一CSVを選択して判定）"])
 
 with tab1:
-    st.subheader("入力方法を選んでください")
+    st.subheader("① 入力 → 変換（統一済みCSVを作成してダウンロード）")
     input_mode = st.radio("入力", ["CSVアップロード", "生データ貼り付け（12列）"], horizontal=True)
 
+    df_unified = None  # このタブ内だけで扱う（session_stateは使わない）
+
     if input_mode == "CSVアップロード":
-        uploaded = st.file_uploader("CSVをアップロード", type=["csv"])
+        uploaded = st.file_uploader("元CSVをアップロード（ヘッダーあり想定）", type=["csv"], key="tab1_csv")
         if uploaded:
             df = pd.read_csv(uploaded)
             df = normalize_columns(df)
             df = ensure_meta_columns(df, date_str, shop, machine)
             df = compute_rates_if_needed(df)
 
-            # 必須列チェック
-            required = ["unit_number","total_start","bb_count","rb_count","rb_rate","gassan_rate"]
-            missing = [c for c in required if c not in df.columns]
-            if missing:
-                st.error(f"必要な列が足りません: {missing}")
-            else:
-                # 列順をHEADERに寄せる（無い列はそのまま）
-                for c in HEADER:
-                    if c not in df.columns:
-                        df[c] = np.nan
-                df = df[HEADER]
-                st.session_state["df_unified"] = df
-                st.success(f"CSVを読み込み＆統一しました：{len(df)}行")
-                st.dataframe(df.head(30), use_container_width=True, hide_index=True)
-                st.download_button("統一済みCSVをダウンロード", data=to_csv_bytes(df), file_name="unified.csv", mime="text/csv")
+            # HEADERに寄せる（足りない列は作る）
+            for c in HEADER:
+                if c not in df.columns:
+                    df[c] = np.nan
+            df_unified = df[HEADER]
 
     else:
         sample = "478 45 3539 19 11 0 2481 1/186.3 1/321.7 0.0 118.0 449"
-        raw_text = st.text_area("台データオンラインの行を貼り付け（複数行OK）", value=sample, height=220)
-        if st.button("変換して統一する", type="primary"):
-            df = parse_raw12(raw_text, date_str, shop, machine)
-            st.session_state["df_unified"] = df
-            st.success(f"貼り付けデータを統一しました：{len(df)}行")
-            st.dataframe(df.head(30), use_container_width=True, hide_index=True)
-            st.download_button("統一済みCSVをダウンロード", data=to_csv_bytes(df), file_name="unified.csv", mime="text/csv")
+        raw_text = st.text_area("台データオンラインの行を貼り付け（複数行OK）", value=sample, height=220, key="tab1_raw")
+        if st.button("変換して統一CSVを作る", type="primary", key="tab1_convert"):
+            df_unified = parse_raw12(raw_text, date_str, shop, machine)
+
+    if df_unified is None:
+        st.info("入力を行うと、ここに統一済みデータが表示され、CSVダウンロードできます。")
+    else:
+        st.success(f"統一済みデータを作成しました：{len(df_unified)}行")
+        st.dataframe(df_unified.head(30), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "統一済みCSVをダウンロード（unified.csv）",
+            data=to_csv_bytes(df_unified),
+            file_name="unified.csv",
+            mime="text/csv",
+            key="tab1_dl_unified"
+        )
+
+        st.caption("次に「夕方候補」タブで、この unified.csv をアップロードして判定します。")
+
 
 with tab2:
-    st.subheader("夕方候補（本日データのみ）")
-    df = st.session_state.get("df_unified")
+    st.subheader("② 夕方候補（統一済みCSVをアップロードして判定）")
 
-    if df is None or len(df) == 0:
-        st.info("先に「入力 → 変換」タブでデータを読み込んでください。")
+    unified_file = st.file_uploader("統一済みCSV（unified.csv）をアップロード", type=["csv"], key="tab2_unified")
+    if not unified_file:
+        st.info("タブ1でダウンロードした unified.csv をここで選択してください。")
         st.stop()
 
-    # =========================
-    # 安定化：比較・計算用の数値列を作る
-    # =========================
-    df = df.copy()
+    # 統一済みCSVを読み込み
+    df = pd.read_csv(unified_file)
+    df = normalize_columns(df)  # 念のため
+    df = compute_rates_if_needed(df)  # 念のため
+    for c in HEADER:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[HEADER].copy()
+
+    # 安定化：判定用の数値列を作る
     df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
     df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
     df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
 
-    # =========================
-    # 夕方候補抽出（num列で判定）
-    # =========================
+    # 夕方候補抽出
     cand = df[
         (df["total_start_num"] >= min_games) &
         (df["rb_rate_num"] <= max_rb) &
@@ -253,32 +258,23 @@ with tab2:
 
     if cand.empty:
         st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
-        # デバッグしたいときは以下を一時的に表示すると便利です
-        # st.write(df[["unit_number","total_start","rb_rate","gassan_rate","total_start_num","rb_rate_num","gassan_rate_num"]].head(30))
         st.stop()
 
-    # =========================
-    # スコア（REG最重視：num列で計算）
-    # =========================
+    # スコア（REG最重視）
     cand["score"] = (
         (max_rb / cand["rb_rate_num"]) * 70 +
         (cand["total_start_num"] / max(min_games, 1)) * 20 +
         (max_gassan / cand["gassan_rate_num"]) * 10
     )
 
-    # 並び順：REG優先 → 総回転
     cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False])
 
-    # =========================
-    # 表示用（見せたい列だけ）
-    # =========================
     show = cand[[
         "date","shop","machine",
         "unit_number","total_start","bb_count","rb_count",
         "bb_rate","rb_rate","gassan_rate","score"
     ]].copy()
 
-    # 表示を整える（小数1桁）
     for c in ["bb_rate","rb_rate","gassan_rate","score"]:
         show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
 
@@ -289,4 +285,5 @@ with tab2:
         data=to_csv_bytes(show),
         file_name="evening_candidates.csv",
         mime="text/csv",
+        key="tab2_dl_candidates"
     )
