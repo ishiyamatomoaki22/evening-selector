@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 # ========= Config =========
 HEADER = [
@@ -173,7 +174,7 @@ def make_filename(machine: str, suffix: str, date_str: str) -> str:
     YYYY-MM-dd_HH-mm-ss_機種名_suffix.csv
     suffix例: evening / candidates
     """
-    time_part = datetime.now().strftime("%H-%M-%S")
+    time_part = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%H-%M-%S")
 
     safe_machine = (
         str(machine)
@@ -222,13 +223,12 @@ def make_safe_filename_part(s: str) -> str:
         .replace(":", "-")
     )
 
-def make_log_filename(date_str: str, machine: str) -> str:
+def make_log_filename(date_str: str) -> str:
     """
-    YYYY-MM-dd_HH-mm-ss_機種名_playlog.csv
+    YYYY-MM-dd_HH-mm-ss_playlog.csv
     """
-    time_part = datetime.now().strftime("%H-%M-%S")
-    safe_machine = make_safe_filename_part(machine)
-    return f"{date_str}_{time_part}_{safe_machine}_playlog.csv"
+    time_part = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%H-%M-%S")
+    return f"{date_str}_{time_part}_playlog.csv"
 
 
 # ========= Sidebar: meta & thresholds =========
@@ -488,7 +488,7 @@ with tab3:
             st.stop()
 
         new_row = {
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S"),
             "date": log_date,
             "shop": log_shop,
             "machine": log_machine,
@@ -504,7 +504,7 @@ with tab3:
         }
 
         out_bytes = append_row_to_uploaded_csv(uploaded_log.getvalue(), new_row)
-        out_name = make_log_filename(log_date, log_machine)
+        out_name = make_log_filename(log_date)
 
         st.success("追記済みの更新版CSVを作成しました。下のボタンからダウンロードしてください。")
         st.download_button(
