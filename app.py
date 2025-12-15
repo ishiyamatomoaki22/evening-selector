@@ -230,6 +230,40 @@ def make_log_filename(date_str: str) -> str:
     time_part = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%H-%M-%S")
     return f"{date_str}_{time_part}_playlog.csv"
 
+# ========= Island Master =========
+ISLAND_HEADER = ["unit_number","island_id","side","pos","edge_type","is_end"]
+
+def load_island_master(uploaded) -> pd.DataFrame:
+    if uploaded is None:
+        return pd.DataFrame(columns=ISLAND_HEADER)
+
+    df = pd.read_csv(uploaded)
+    df.columns = df.columns.astype(str).str.strip()
+
+    need = set(ISLAND_HEADER)
+    if not need.issubset(df.columns):
+        st.warning("島マスタの列が不足しています。島情報なしで続行します。")
+        return pd.DataFrame(columns=ISLAND_HEADER)
+
+    df = df[ISLAND_HEADER].copy()
+    df["unit_number"] = pd.to_numeric(df["unit_number"], errors="coerce")
+    df = df[df["unit_number"].notna()].copy()
+    df["unit_number"] = df["unit_number"].astype(int)
+
+    df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
+    df["is_end"] = pd.to_numeric(df["is_end"], errors="coerce").fillna(0).astype(int)
+    return df
+
+def join_island(df: pd.DataFrame, island_df: pd.DataFrame) -> pd.DataFrame:
+    if island_df is None or island_df.empty:
+        return df
+    out = df.copy()
+    out["unit_number"] = pd.to_numeric(out["unit_number"], errors="coerce")
+    out = out[out["unit_number"].notna()].copy()
+    out["unit_number"] = out["unit_number"].astype(int)
+    return out.merge(island_df, on="unit_number", how="left")
+
+
 
 # ========= Sidebar: meta & thresholds =========
 # 初期化（スライダー値をsession_stateで持つ）
@@ -318,6 +352,15 @@ with st.sidebar:
     top_n = st.number_input("上位N件表示", 1, 200, 30, 1)
 
 # ========= Main UI =========
+st.divider()
+st.subheader("任意：島マスタアップロード（並び判定に使用）")
+island_file = st.file_uploader(
+    "島マスタCSV（island.csv）",
+    type=["csv"],
+    key="island_csv_evening"
+)
+island_df = load_island_master(island_file)
+
 tab1, tab2, tab3 = st.tabs([
     "入力 → 変換（統一CSV作成）",
     "夕方候補（統一CSVを選択して判定）",
@@ -385,6 +428,8 @@ with tab2:
         if c not in df.columns:
             df[c] = np.nan
     df = df[HEADER].copy()
+    df = join_island(df, island_df)
+
 
     # 安定化：判定用の数値列を作る
     df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
@@ -398,6 +443,32 @@ with tab2:
         (df["gassan_rate_num"] <= max_gassan)
     ].copy()
 
+    # ===== 並びボーナス（run_bonus）=====
+    cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
+    cand["run_bonus"] = 0
+
+    if "island_id" in cand.columns and cand["island_id"].notna().any():
+        key_cols = ["island_id", "side"]
+        pos_map = (
+            cand.dropna(subset=["pos_num"])
+            .groupby(key_cols)["pos_num"]
+            .apply(lambda s: set(s.astype(int)))
+            .to_dict()
+        )
+
+        def _run_bonus(row):
+            if pd.isna(row["pos_num"]):
+                return 0
+            k = (row["island_id"], row["side"])
+            if k not in pos_map:
+                return 0
+            p = int(row["pos_num"])
+            s = pos_map[k]
+            return 1 if ((p - 1 in s) or (p + 1 in s)) else 0
+
+        cand["run_bonus"] = cand.apply(_run_bonus, axis=1)
+
+
     if cand.empty:
         st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
         st.stop()
@@ -409,13 +480,17 @@ with tab2:
         (max_gassan / cand["gassan_rate_num"]) * 10
     )
 
+    cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
+
     cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False])
 
     show = cand[[
         "date","shop","machine",
         "unit_number","total_start","bb_count","rb_count",
-        "bb_rate","rb_rate","gassan_rate","score"
+        "bb_rate","rb_rate","gassan_rate",
+        "run_bonus","score"
     ]].copy()
+
 
     for c in ["bb_rate","rb_rate","gassan_rate","score"]:
         show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
