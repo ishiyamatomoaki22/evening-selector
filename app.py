@@ -411,101 +411,101 @@ with tab1:
 
         st.caption("次に「夕方候補」タブで、この unified.csv をアップロードして判定します。")
 
-
 with tab2:
     st.subheader("② 夕方候補（統一済みCSVをアップロードして判定）")
 
-    unified_file = st.file_uploader("統一済みCSV（unified.csv）をアップロード", type=["csv"], key="tab2_unified")
+    unified_file = st.file_uploader(
+        "統一済みCSV（unified.csv）をアップロード",
+        type=["csv"],
+        key="tab2_unified"
+    )
+
     if not unified_file:
         st.info("タブ1でダウンロードした unified.csv をここで選択してください。")
-        st.stop()
+    else:
+        # 統一済みCSVを読み込み
+        df = pd.read_csv(unified_file)
+        df = normalize_columns(df)          # 念のため
+        df = compute_rates_if_needed(df)    # 念のため
 
-    # 統一済みCSVを読み込み
-    df = pd.read_csv(unified_file)
-    df = normalize_columns(df)  # 念のため
-    df = compute_rates_if_needed(df)  # 念のため
-    for c in HEADER:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df[HEADER].copy()
-    df = join_island(df, island_df)
+        for c in HEADER:
+            if c not in df.columns:
+                df[c] = np.nan
+        df = df[HEADER].copy()
+        df = join_island(df, island_df)
 
+        # 安定化：判定用の数値列を作る
+        df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
+        df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
+        df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
 
-    # 安定化：判定用の数値列を作る
-    df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
-    df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
-    df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
+        # 夕方候補抽出
+        cand = df[
+            (df["total_start_num"] >= min_games) &
+            (df["rb_rate_num"] <= max_rb) &
+            (df["gassan_rate_num"] <= max_gassan)
+        ].copy()
 
-    # 夕方候補抽出
-    cand = df[
-        (df["total_start_num"] >= min_games) &
-        (df["rb_rate_num"] <= max_rb) &
-        (df["gassan_rate_num"] <= max_gassan)
-    ].copy()
+        # ===== 並びボーナス（run_bonus）=====
+        cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
+        cand["run_bonus"] = 0
 
-    # ===== 並びボーナス（run_bonus）=====
-    cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
-    cand["run_bonus"] = 0
+        if "island_id" in cand.columns and cand["island_id"].notna().any():
+            key_cols = ["island_id", "side"]
+            pos_map = (
+                cand.dropna(subset=["pos_num"])
+                .groupby(key_cols)["pos_num"]
+                .apply(lambda s: set(s.astype(int)))
+                .to_dict()
+            )
 
-    if "island_id" in cand.columns and cand["island_id"].notna().any():
-        key_cols = ["island_id", "side"]
-        pos_map = (
-            cand.dropna(subset=["pos_num"])
-            .groupby(key_cols)["pos_num"]
-            .apply(lambda s: set(s.astype(int)))
-            .to_dict()
-        )
+            def _run_bonus(row):
+                if pd.isna(row["pos_num"]):
+                    return 0
+                k = (row["island_id"], row["side"])
+                if k not in pos_map:
+                    return 0
+                p = int(row["pos_num"])
+                s = pos_map[k]
+                return 1 if ((p - 1 in s) or (p + 1 in s)) else 0
 
-        def _run_bonus(row):
-            if pd.isna(row["pos_num"]):
-                return 0
-            k = (row["island_id"], row["side"])
-            if k not in pos_map:
-                return 0
-            p = int(row["pos_num"])
-            s = pos_map[k]
-            return 1 if ((p - 1 in s) or (p + 1 in s)) else 0
+            cand["run_bonus"] = cand.apply(_run_bonus, axis=1)
 
-        cand["run_bonus"] = cand.apply(_run_bonus, axis=1)
+        if cand.empty:
+            st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
+        else:
+            # スコア（REG最重視）
+            cand["score"] = (
+                (max_rb / cand["rb_rate_num"]) * 70 +
+                (cand["total_start_num"] / max(min_games, 1)) * 20 +
+                (max_gassan / cand["gassan_rate_num"]) * 10
+            )
+            cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
 
+            cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False])
 
-    if cand.empty:
-        st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
-        st.stop()
+            show = cand[[
+                "date","shop","machine",
+                "unit_number","total_start","bb_count","rb_count",
+                "bb_rate","rb_rate","gassan_rate",
+                "run_bonus","score"
+            ]].copy()
 
-    # スコア（REG最重視）
-    cand["score"] = (
-        (max_rb / cand["rb_rate_num"]) * 70 +
-        (cand["total_start_num"] / max(min_games, 1)) * 20 +
-        (max_gassan / cand["gassan_rate_num"]) * 10
-    )
+            for c in ["bb_rate","rb_rate","gassan_rate","score"]:
+                show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
 
-    cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
+            st.dataframe(show.head(int(top_n)), use_container_width=True, hide_index=True)
 
-    cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False])
+            filename = make_filename(machine, "candidates", date_str)
 
-    show = cand[[
-        "date","shop","machine",
-        "unit_number","total_start","bb_count","rb_count",
-        "bb_rate","rb_rate","gassan_rate",
-        "run_bonus","score"
-    ]].copy()
+            st.download_button(
+                "候補台をCSVでダウンロード",
+                data=to_csv_bytes(show),
+                file_name=filename,
+                mime="text/csv",
+                key="tab2_dl_candidates"
+            )
 
-
-    for c in ["bb_rate","rb_rate","gassan_rate","score"]:
-        show[c] = pd.to_numeric(show[c], errors="coerce").round(1)
-
-    st.dataframe(show.head(int(top_n)), use_container_width=True, hide_index=True)
-
-    filename = make_filename(machine, "candidates", date_str)
-
-    st.download_button(
-        "候補台をCSVでダウンロード",
-        data=to_csv_bytes(show),
-        file_name=filename,
-        mime="text/csv",
-        key="tab2_dl_candidates"
-    )
 
 with tab3:
     st.subheader("③ 実戦ログ（ローカルCSVに追記 → 更新版をダウンロード）")
