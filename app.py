@@ -10,7 +10,9 @@ from zoneinfo import ZoneInfo
 HEADER = [
     "date","shop","machine",
     "unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals",
-    "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end"
+    "bb_rate","rb_rate","art_rate","gassan_rate","prev_day_end",
+    # ---- date context (NEW) ----
+    "dow_num","dow","is_weekend","special_flag","special_name"
 ]
 
 SHOP_PRESETS = ["武蔵境", "吉祥寺", "三鷹", "国分寺", "新宿", "渋谷"]
@@ -19,6 +21,8 @@ MACHINE_PRESETS = ["マイジャグラーV", "ゴーゴージャグラー3", "�
 st.set_page_config(page_title="ジャグラー夕方セレクター", layout="wide")
 st.title("ジャグラー 夕方続行セレクター（変換→選定まで一発）")
 st.caption("入力（CSV or 生テキスト）→ ヘッダー統一 → 夕方判定 → 候補台を出力")
+
+JST = ZoneInfo("Asia/Tokyo")
 
 # 機種ごとのおすすめ設定（夕方向け・目安）
 RECOMMENDED = {
@@ -31,6 +35,63 @@ RECOMMENDED = {
     "ネオアイムジャグラーEX":  {"min_games": 2500, "max_rb": 330.0, "max_gassan": 200.0},
     "ウルトラミラクルジャグラー":{"min_games": 3500, "max_rb": 300.0, "max_gassan": 195.0},
 }
+
+# ========= Date Context (NEW) =========
+DOW_LABEL = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+SPECIAL_COLS = ["date", "special_flag", "special_name"]
+
+def load_special_days(uploaded_file) -> pd.DataFrame:
+    df = pd.read_csv(uploaded_file)
+    if "date" not in df.columns:
+        raise ValueError("特定日マスタには date 列が必要です（YYYY-MM-DD）")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df.dropna(subset=["date"]).copy()
+
+    if "special_flag" not in df.columns:
+        df["special_flag"] = 1
+    df["special_flag"] = pd.to_numeric(df["special_flag"], errors="coerce").fillna(1).astype(int).clip(0, 1)
+
+    if "special_name" not in df.columns:
+        df["special_name"] = ""
+    df["special_name"] = df["special_name"].astype(str).fillna("").str.strip()
+
+    df = df.sort_values("date").drop_duplicates("date", keep="last")
+    return df[SPECIAL_COLS].copy()
+
+def add_date_context(df: pd.DataFrame, special_days: pd.DataFrame | None = None) -> pd.DataFrame:
+    out = df.copy()
+    out["date"] = pd.to_datetime(out.get("date", pd.NaT), errors="coerce")
+    out["date"] = out["date"].dt.date
+
+    out["dow_num"] = pd.to_datetime(out["date"], errors="coerce").dt.weekday
+    out["dow"] = out["dow_num"].map(DOW_LABEL)
+    out["is_weekend"] = out["dow_num"].isin([5, 6]).astype(int)
+
+    out["special_flag"] = 0
+    out["special_name"] = ""
+
+    if special_days is not None and not special_days.empty:
+        sd = special_days.copy()
+        sd["date"] = pd.to_datetime(sd["date"], errors="coerce").dt.date
+        sd = sd.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+        sd["special_flag"] = pd.to_numeric(sd["special_flag"], errors="coerce").fillna(1).astype(int).clip(0, 1)
+        sd["special_name"] = sd["special_name"].astype(str).fillna("").str.strip()
+
+        out = out.merge(sd, on="date", how="left", suffixes=("", "_m"))
+        out["special_flag"] = out["special_flag_m"].fillna(out["special_flag"]).astype(int)
+        out["special_name"] = out["special_name_m"].fillna(out["special_name"]).astype(str)
+        out = out.drop(columns=["special_flag_m", "special_name_m"], errors="ignore")
+
+    return out
+
+def special_days_template_bytes() -> bytes:
+    tmp = pd.DataFrame([
+        {"date":"2025-12-07", "special_flag":1, "special_name":"例：イベント/取材/周年"},
+        {"date":"2025-12-08", "special_flag":1, "special_name":"例：ゾロ目"},
+    ])
+    return tmp.to_csv(index=False).encode("utf-8-sig")
 
 # ========= Helpers =========
 def parse_rate_token(tok: str) -> float:
@@ -49,9 +110,7 @@ def parse_rate_token(tok: str) -> float:
         return np.nan
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # 列名の空白除去
     df.columns = df.columns.astype(str).str.strip()
-
     rename_map = {
         "台番": "unit_number",
         "台番号": "unit_number",
@@ -73,23 +132,19 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
 
 def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    # まず numeric 列の整形（カンマ除去も）
     for c in ["unit_number","start_games","total_start","bb_count","rb_count","art_count","max_medals","prev_day_end"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
 
-    # rate列が無ければ作る
     for c in ["bb_rate","rb_rate","art_rate","gassan_rate"]:
         if c not in df.columns:
             df[c] = np.nan
 
-    # 文字列の確率を分母に統一
     df["bb_rate"] = df["bb_rate"].map(parse_rate_token)
     df["rb_rate"] = df["rb_rate"].map(parse_rate_token)
     df["art_rate"] = df["art_rate"].map(parse_rate_token)
     df["gassan_rate"] = df["gassan_rate"].map(parse_rate_token)
 
-    # 欠損を total_start / 回数 で補完（必要な場合）
     if "total_start" in df.columns:
         bb_mask = df["bb_rate"].isna() & df["bb_count"].gt(0)
         rb_mask = df["rb_rate"].isna() & df["rb_count"].gt(0)
@@ -102,39 +157,31 @@ def compute_rates_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def clean_to_12_parts(line: str):
-    """
-    先頭にアイコン等のゴミが混ざっても、
-    数値/確率(1/xxx)だけ抽出して12列に整形する。
-    """
     line = line.strip()
     if not line:
         return None
 
     parts = re.split(r"\s+", line)
 
-    # 数値 or 1/数値 だけ残す
     def is_data_token(tok: str) -> bool:
         tok = tok.strip().replace(",", "")
         return bool(re.match(r"^(?:\d+(?:\.\d+)?|1/\d+(?:\.\d+)?)$", tok))
 
     data_parts = [p.replace(",", "") for p in parts if is_data_token(p)]
 
-    # 先頭に余計なものが入った場合は data_parts が13個以上になることがある
     if len(data_parts) > 12:
-        data_parts = data_parts[-12:]  # ★最後の12個を採用（先頭ゴミ対策）
+        data_parts = data_parts[-12:]
 
     if len(data_parts) != 12:
-        return None  # 呼び出し側でエラー処理
+        return None
 
     return data_parts
-
 
 def parse_raw12(text: str, date_str: str, shop: str, machine: str) -> pd.DataFrame:
     rows = []
     for line_no, line in enumerate((text or "").splitlines(), start=1):
         parts12 = clean_to_12_parts(line)
         if parts12 is None:
-            # 空行はスキップ、そうでなければ原因が分かるようにエラー
             if line.strip() == "":
                 continue
             raise ValueError(f"{line_no}行目：12列に整形できませんでした: {line}")
@@ -149,7 +196,8 @@ def parse_raw12(text: str, date_str: str, shop: str, machine: str) -> pd.DataFra
             "prev_day_end": prev_day_end
         })
 
-    df = pd.DataFrame(rows, columns=HEADER)
+    df = pd.DataFrame(rows)
+    df = normalize_columns(df)
     df = compute_rates_if_needed(df)
     return df
 
@@ -160,7 +208,7 @@ def ensure_meta_columns(df: pd.DataFrame, date_str: str, shop: str, machine: str
         df["shop"] = shop
     if "machine" not in df.columns:
         df["machine"] = machine
-    # 空欄補完
+
     df["date"] = df["date"].fillna(date_str)
     df["shop"] = df["shop"].fillna(shop)
     df["machine"] = df["machine"].fillna(machine)
@@ -170,12 +218,7 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 def make_filename(machine: str, suffix: str, date_str: str) -> str:
-    """
-    YYYY-MM-dd_HH-mm-ss_機種名_suffix.csv
-    suffix例: evening / candidates
-    """
-    time_part = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%H-%M-%S")
-
+    time_part = datetime.now(JST).strftime("%H-%M-%S")
     safe_machine = (
         str(machine)
         .replace(" ", "")
@@ -183,12 +226,11 @@ def make_filename(machine: str, suffix: str, date_str: str) -> str:
         .replace("\\", "_")
         .replace(":", "-")
     )
-
     return f"{date_str}_{time_part}_{safe_machine}_{suffix}.csv"
 
 # ======== Play Log (append to uploaded CSV) ========
 PLAYLOG_HEADER = [
-    "created_at",          # 記録作成日時（自動）
+    "created_at",
     "date","shop","machine","unit_number",
     "start_time","end_time",
     "invest_medals","payout_medals","profit_medals",
@@ -197,37 +239,17 @@ PLAYLOG_HEADER = [
 ]
 
 def append_row_to_uploaded_csv(uploaded_bytes: bytes, new_row: dict) -> bytes:
-    """
-    既存CSV(アップロード)を読み込み → 1行追記 → CSV bytes を返す
-    """
     df = pd.read_csv(io.BytesIO(uploaded_bytes))
-
-    # ヘッダー不足でも壊れないように補完
     for c in PLAYLOG_HEADER:
         if c not in df.columns:
             df[c] = np.nan
     df = df[PLAYLOG_HEADER]
-
-    # 追記行
     df2 = pd.DataFrame([new_row], columns=PLAYLOG_HEADER)
     df_out = pd.concat([df, df2], ignore_index=True)
-
     return df_out.to_csv(index=False).encode("utf-8-sig")
 
-def make_safe_filename_part(s: str) -> str:
-    return (
-        str(s)
-        .replace(" ", "")
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace(":", "-")
-    )
-
 def make_log_filename(date_str: str) -> str:
-    """
-    YYYY-MM-dd_HH-mm-ss_playlog.csv
-    """
-    time_part = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%H-%M-%S")
+    time_part = datetime.now(JST).strftime("%H-%M-%S")
     return f"{date_str}_{time_part}_playlog.csv"
 
 # ========= Island Master =========
@@ -263,10 +285,7 @@ def join_island(df: pd.DataFrame, island_df: pd.DataFrame) -> pd.DataFrame:
     out["unit_number"] = out["unit_number"].astype(int)
     return out.merge(island_df, on="unit_number", how="left")
 
-
-
 # ========= Sidebar: meta & thresholds =========
-# 初期化（スライダー値をsession_stateで持つ）
 if "min_games" not in st.session_state:
     st.session_state["min_games"] = 3000
 if "max_rb" not in st.session_state:
@@ -294,8 +313,6 @@ with st.sidebar:
         shop = st.text_input("shop", value="武蔵境")
 
     machine_mode = st.radio("機種", ["選択", "手入力"], horizontal=True)
-
-    # 機種：選択時はプリセット候補。選択されたらおすすめ値を自動セット
     if machine_mode == "選択":
         machine = st.selectbox(
             "machine",
@@ -304,12 +321,10 @@ with st.sidebar:
             on_change=lambda: apply_recommended(st.session_state["machine_select"]),
             key="machine_select",
         )
-        # selectboxの返り値(machine)とkey("machine_select")は同値になります
         machine = st.session_state["machine_select"]
     else:
         machine = st.text_input("machine", value="マイジャグラーV")
 
-    # ---- 補足的におすすめ値を表示（メインではなく控えめに）----
     rec = RECOMMENDED.get(machine)
     with st.expander("おすすめ設定値（補足）", expanded=False):
         if rec:
@@ -326,7 +341,6 @@ with st.sidebar:
     st.divider()
     st.header("夕方判定（スライダー）")
 
-    # ★ keyを付けて、session_stateの値を直接使う
     min_games = st.slider(
         "最低 総回転（total_start）",
         0, 10000,
@@ -354,11 +368,7 @@ with st.sidebar:
 # ========= Main UI =========
 st.divider()
 st.subheader("任意：島マスタアップロード（並び判定に使用）")
-island_file = st.file_uploader(
-    "島マスタCSV（island.csv）",
-    type=["csv"],
-    key="island_csv_evening"
-)
+island_file = st.file_uploader("島マスタCSV（island.csv）", type=["csv"], key="island_csv_evening")
 island_df = load_island_master(island_file)
 
 tab1, tab2, tab3 = st.tabs([
@@ -369,9 +379,29 @@ tab1, tab2, tab3 = st.tabs([
 
 with tab1:
     st.subheader("① 入力 → 変換（統一済みCSVを作成してダウンロード）")
-    input_mode = st.radio("入力", ["CSVアップロード", "生データ貼り付け（12列）"], horizontal=True)
 
-    df_unified = None  # このタブ内だけで扱う（session_stateは使わない）
+    st.subheader("補完情報（日付コンテキスト：曜日/週末/特定日）")
+    special_file = st.file_uploader("特定日マスタ（任意：special_days.csv）", type=["csv"], key="special_days_csv_evening")
+    st.download_button(
+        "特定日マスタのテンプレCSVをダウンロード",
+        data=special_days_template_bytes(),
+        file_name="special_days_template.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_special_template_evening"
+    )
+    special_df = None
+    if special_file is not None:
+        try:
+            special_df = load_special_days(special_file)
+            st.success(f"特定日マスタ読込OK：{len(special_df)}日")
+            st.dataframe(special_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"特定日マスタの読み込みに失敗しました: {e}")
+            st.stop()
+
+    input_mode = st.radio("入力", ["CSVアップロード", "生データ貼り付け（12列）"], horizontal=True)
+    df_unified = None
 
     if input_mode == "CSVアップロード":
         uploaded = st.file_uploader("元CSVをアップロード（ヘッダーあり想定）", type=["csv"], key="tab1_csv")
@@ -381,17 +411,28 @@ with tab1:
             df = ensure_meta_columns(df, date_str, shop, machine)
             df = compute_rates_if_needed(df)
 
-            # HEADERに寄せる（足りない列は作る）
+            # 日付コンテキスト付与（NEW）
+            df = add_date_context(df, special_df)
+
+            # HEADERに寄せる
             for c in HEADER:
                 if c not in df.columns:
                     df[c] = np.nan
-            df_unified = df[HEADER]
+            df_unified = df[HEADER].copy()
 
     else:
         sample = "478 45 3539 19 11 0 2481 1/186.3 1/321.7 0.0 118.0 449"
         raw_text = st.text_area("台データオンラインの行を貼り付け（複数行OK）", value=sample, height=220, key="tab1_raw")
         if st.button("変換して統一CSVを作る", type="primary", key="tab1_convert"):
             df_unified = parse_raw12(raw_text, date_str, shop, machine)
+
+            # 日付コンテキスト付与（NEW）
+            df_unified = add_date_context(df_unified, special_df)
+
+            for c in HEADER:
+                if c not in df_unified.columns:
+                    df_unified[c] = np.nan
+            df_unified = df_unified[HEADER].copy()
 
     if df_unified is None:
         st.info("入力を行うと、ここに統一済みデータが表示され、CSVダウンロードできます。")
@@ -400,7 +441,6 @@ with tab1:
         st.dataframe(df_unified.head(30), use_container_width=True, hide_index=True)
 
         filename = make_filename(machine, "original", date_str)
-
         st.download_button(
             "統一済みCSVをダウンロード",
             data=to_csv_bytes(df_unified),
@@ -408,45 +448,40 @@ with tab1:
             mime="text/csv",
             key="tab1_dl_unified"
         )
-
         st.caption("次に「夕方候補」タブで、この unified.csv をアップロードして判定します。")
 
 with tab2:
     st.subheader("② 夕方候補（統一済みCSVをアップロードして判定）")
 
-    unified_file = st.file_uploader(
-        "統一済みCSV（unified.csv）をアップロード",
-        type=["csv"],
-        key="tab2_unified"
-    )
+    unified_file = st.file_uploader("統一済みCSV（unified.csv）をアップロード", type=["csv"], key="tab2_unified")
 
     if not unified_file:
         st.info("タブ1でダウンロードした unified.csv をここで選択してください。")
     else:
-        # 統一済みCSVを読み込み
         df = pd.read_csv(unified_file)
-        df = normalize_columns(df)          # 念のため
-        df = compute_rates_if_needed(df)    # 念のため
+        df = normalize_columns(df)
+        df = compute_rates_if_needed(df)
+
+        # 既存unifiedに曜日列が無くても自動補完（specialはここでは0扱い）
+        df = add_date_context(df, special_days=None)
 
         for c in HEADER:
             if c not in df.columns:
                 df[c] = np.nan
         df = df[HEADER].copy()
+
         df = join_island(df, island_df)
 
-        # 安定化：判定用の数値列を作る
         df["total_start_num"] = pd.to_numeric(df["total_start"], errors="coerce")
         df["rb_rate_num"] = pd.to_numeric(df["rb_rate"], errors="coerce")
         df["gassan_rate_num"] = pd.to_numeric(df["gassan_rate"], errors="coerce")
 
-        # 夕方候補抽出
         cand = df[
             (df["total_start_num"] >= min_games) &
             (df["rb_rate_num"] <= max_rb) &
             (df["gassan_rate_num"] <= max_gassan)
         ].copy()
 
-        # ===== 並びボーナス（run_bonus）=====
         cand["pos_num"] = pd.to_numeric(cand.get("pos", np.nan), errors="coerce")
         cand["run_bonus"] = 0
 
@@ -474,21 +509,20 @@ with tab2:
         if cand.empty:
             st.warning("条件に合う台がありません。閾値を緩めるか、回転数が増えてから再判定してください。")
         else:
-            # スコア（REG最重視）
             cand["score"] = (
                 (max_rb / cand["rb_rate_num"]) * 70 +
                 (cand["total_start_num"] / max(min_games, 1)) * 20 +
                 (max_gassan / cand["gassan_rate_num"]) * 10
             )
             cand["score"] = cand["score"] + (cand["run_bonus"] * 1.5)
-
             cand = cand.sort_values(["rb_rate_num", "total_start_num"], ascending=[True, False])
 
             show = cand[[
                 "date","shop","machine",
                 "unit_number","total_start","bb_count","rb_count",
                 "bb_rate","rb_rate","gassan_rate",
-                "run_bonus","score"
+                "run_bonus","score",
+                "dow","is_weekend","special_flag","special_name"
             ]].copy()
 
             for c in ["bb_rate","rb_rate","gassan_rate","score"]:
@@ -497,7 +531,6 @@ with tab2:
             st.dataframe(show.head(int(top_n)), use_container_width=True, hide_index=True)
 
             filename = make_filename(machine, "candidates", date_str)
-
             st.download_button(
                 "候補台をCSVでダウンロード",
                 data=to_csv_bytes(show),
@@ -506,21 +539,13 @@ with tab2:
                 key="tab2_dl_candidates"
             )
 
-
 with tab3:
     st.subheader("③ 実戦ログ（ローカルCSVに追記 → 更新版をダウンロード）")
     st.caption("※ Streamlit Cloudではローカルファイルを直接書き換えできないため、追記した“更新版CSV”を生成してダウンロードします。")
 
-    # 1) 追記対象のCSVをアップロード
-    uploaded_log = st.file_uploader(
-        "追記したいログCSVを選択（既存のplay_log.csvなど）",
-        type=["csv"],
-        key="tab3_log_upload"
-    )
-
+    uploaded_log = st.file_uploader("追記したいログCSVを選択（既存のplay_log.csvなど）", type=["csv"], key="tab3_log_upload")
     st.divider()
 
-    # 2) 入力フォーム（必要最低限＋任意）
     with st.form("playlog_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -553,17 +578,15 @@ with tab3:
             st.metric("profit_medals（収支枚）", profit)
 
         memo = st.text_area("memo（任意）", value="", height=100)
-
         submit = st.form_submit_button("この内容で追記用データを作成", type="primary")
 
-    # 3) 追記 → 更新版CSVダウンロード
     if submit:
         if uploaded_log is None:
             st.error("先に「追記したいログCSV」を選択してください。")
             st.stop()
 
         new_row = {
-            "created_at": datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
             "date": log_date,
             "shop": log_shop,
             "machine": log_machine,
@@ -590,7 +613,6 @@ with tab3:
             key="tab3_log_download"
         )
 
-        # 参考：追記後のプレビュー
         st.divider()
         st.markdown("#### 追記後プレビュー（末尾5行）")
         preview_df = pd.read_csv(io.BytesIO(out_bytes))
